@@ -2,7 +2,7 @@ import re
 import ssl
 import urllib.parse
 
-import aioredis.sentinel
+from redis.asyncio import Sentinel as AsyncRedisSentinel
 
 
 class SentinelConfigError(Exception):
@@ -99,10 +99,7 @@ class Sentinel:
         self.redis_kwargs = kwargs
 
     async def get_sentinel(self):
-        '''
-        Retrieve sentinel object from aioredis.
-        '''
-        return await aioredis.sentinel.create_sentinel(
+        return AsyncRedisSentinel(
             sentinels=self.connection,
             **self.redis_kwargs,
         )

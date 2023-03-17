@@ -5,7 +5,7 @@ import time
 from distutils.version import StrictVersion
 from itertools import groupby
 
-import aioredis
+import redis.asyncio as async_redis
 
 from aioredlock.errors import LockError, LockAcquiringError, LockRuntimeError
 from aioredlock.sentinel import Sentinel
@@ -73,7 +73,7 @@ class Instance:
          * a dict - {'host': 'localhost', 'port': 6379,
                      'db': 0, 'password': 'pass'}
            all keys except host and port will be passed as kwargs to
-           the aioredis.create_redis_pool();
+           the async_redis.create_redis_pool();
          * an aioredlock.redis.Sentinel object;
          * a Redis URI - "redis://host:6379/0?encoding=utf-8";
          * a (host, port) tuple - ('localhost', 6379);
@@ -103,17 +103,16 @@ class Instance:
     @staticmethod
     async def _create_redis_pool(*args, **kwargs):
         """
-        Adapter to support both aioredis-0.3.0 and aioredis-1.0.0
-        For aioredis-1.0.0 and later calls:
-            aioredis.create_redis_pool(*args, **kwargs)
-        For aioredis-0.3.0 calls:
-            aioredis.create_pool(*args, **kwargs)
+        Adapter to support both async_redis-0.3.0 and async_redis-1.0.0
+        For async_redis-1.0.0 and later calls:
+            async_redis.create_redis_pool(*args, **kwargs)
+        For async_redis-0.3.0 calls:
+            async_redis.create_pool(*args, **kwargs)
         """
-
-        if StrictVersion(aioredis.__version__) >= StrictVersion('1.0.0'):  # pragma no cover
-            return await aioredis.create_redis_pool(*args, **kwargs)
-        else:  # pragma no cover
-            return await aioredis.create_pool(*args, **kwargs)
+        kwargs.pop("minsize", None)
+        max_connections = kwargs.pop("maxsize", 10)
+        instance = async_redis.Redis.from_url(*args, **kwargs, max_connections=max_connections)
+        return instance
 
     async def _register_scripts(self, redis):
         tasks = []
@@ -147,7 +146,7 @@ class Instance:
                 kwargs.pop('port', 6379)
             )
             redis_kwargs = kwargs
-        elif isinstance(self.connection, aioredis.Redis):
+        elif isinstance(self.connection, async_redis.Redis):
             self._pool = self.connection
         else:
             # a tuple or list ('localhost', 6379)
@@ -166,16 +165,15 @@ class Instance:
                     self._pool = await self._create_redis_pool(address, **redis_kwargs)
 
         if self.set_lock_script_sha1 is None or self.unset_lock_script_sha1 is None:
-            with await self._pool as redis:
+            async with self._pool as redis:
                 await self._register_scripts(redis)
-
-        return await self._pool
+        return self._pool
 
     async def close(self):
         """
         Closes connection and resets pool
         """
-        if self._pool is not None and not isinstance(self.connection, aioredis.Redis):
+        if self._pool is not None and not isinstance(self.connection, async_redis.Redis):
             self._pool.close()
             await self._pool.wait_closed()
         self._pool = None
@@ -192,21 +190,22 @@ class Instance:
         lock_timeout_ms = int(lock_timeout * 1000)
 
         try:
-            with await self.connect() as redis:
+            async with await self.connect() as redis:
                 if register_scripts is True:
                     await self._register_scripts(redis)
                 await redis.evalsha(
-                    self.set_lock_script_sha1,
-                    keys=[resource],
-                    args=[lock_identifier, lock_timeout_ms]
+                    self.set_lock_script_sha1, 1,
+                    resource, lock_identifier, lock_timeout_ms,
+
+                    # args=[]
                 )
-        except aioredis.errors.ReplyError as exc:  # script fault
+        except async_redis.ResponseError as exc:  # script fault
             if exc.args[0].startswith('NOSCRIPT'):
                 return await self.set_lock(resource, lock_identifier, lock_timeout, register_scripts=True)
             self.log.debug('Can not set lock "%s" on %s',
                            resource, repr(self))
             raise LockAcquiringError('Can not set lock') from exc
-        except (aioredis.errors.RedisError, OSError) as exc:
+        except (async_redis.RedisError, OSError) as exc:
             self.log.error('Can not set lock "%s" on %s: %s',
                            resource, repr(self), repr(exc))
             raise LockRuntimeError('Can not set lock') from exc
@@ -230,21 +229,20 @@ class Instance:
         :raises: LockError if lock is not available
         """
         try:
-            with await self.connect() as redis:
+            async with await self.connect() as redis:
                 if register_scripts is True:
                     await self._register_scripts(redis)
                 ttl = await redis.evalsha(
-                    self.get_lock_ttl_script_sha1,
-                    keys=[resource],
-                    args=[lock_identifier]
+                    self.get_lock_ttl_script_sha1, 1,
+                    resource, lock_identifier
                 )
-        except aioredis.errors.ReplyError as exc:  # script fault
-            if exc.args[0].startswith('NOSCRIPT'):
-                return await self.get_lock_ttl(resource, lock_identifier, register_scripts=True)
-            self.log.debug('Can not get lock "%s" on %s',
-                           resource, repr(self))
-            raise LockAcquiringError('Can not get lock') from exc
-        except (aioredis.errors.RedisError, OSError) as exc:
+        # except async_redis.errors.ReplyError as exc:  # script fault
+        #     if exc.args[0].startswith('NOSCRIPT'):
+        #         return await self.get_lock_ttl(resource, lock_identifier, register_scripts=True)
+        #     self.log.debug('Can not get lock "%s" on %s',
+        #                    resource, repr(self))
+        #     raise LockAcquiringError('Can not get lock') from exc
+        except (async_redis.RedisError, OSError) as exc:
             self.log.error('Can not get lock "%s" on %s: %s',
                            resource, repr(self), repr(exc))
             raise LockRuntimeError('Can not get lock') from exc
@@ -268,21 +266,20 @@ class Instance:
         :raises: LockError if the lock resource acquired with different lock_identifier
         """
         try:
-            with await self.connect() as redis:
+            async with await self.connect() as redis:
                 if register_scripts is True:
                     await self._register_scripts(redis)
                 await redis.evalsha(
-                    self.unset_lock_script_sha1,
-                    keys=[resource],
-                    args=[lock_identifier]
+                    self.unset_lock_script_sha1, 1,
+                    resource, lock_identifier
                 )
-        except aioredis.errors.ReplyError as exc:  # script fault
-            if exc.args[0].startswith('NOSCRIPT'):
-                return await self.unset_lock(resource, lock_identifier, register_scripts=True)
-            self.log.debug('Can not unset lock "%s" on %s',
-                           resource, repr(self))
-            raise LockAcquiringError('Can not unset lock') from exc
-        except (aioredis.errors.RedisError, OSError) as exc:
+        # except async_redis.Err as exc:  # script fault
+        #     if exc.args[0].startswith('NOSCRIPT'):
+        #         return await self.unset_lock(resource, lock_identifier, register_scripts=True)
+        #     self.log.debug('Can not unset lock "%s" on %s',
+        #                    resource, repr(self))
+        #     raise LockAcquiringError('Can not unset lock') from exc
+        except (async_redis.RedisError, OSError) as exc:
             self.log.error('Can not unset lock "%s" on %s: %s',
                            resource, repr(self), repr(exc))
             raise LockRuntimeError('Can not unset lock') from exc
@@ -305,7 +302,7 @@ class Instance:
         :returns: True if locked else False
         """
 
-        with await self.connect() as redis:
+        async with await self.connect() as redis:
             lock_identifier = await redis.get(resource)
         if lock_identifier:
             return True
